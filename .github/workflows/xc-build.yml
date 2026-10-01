@@ -1,7 +1,9 @@
-# XC: build our customized hbbs/hbbr for the XC server deployments (HK + IOC).
-# Builds inside an Alpine container (musl native, same family as the s6 base
-# image) so the output is a static musl binary - the known-good path for both
-# deployments. Triggered manually or by pushes to xc/** branches.
+# XC: build our customized hbbs/hbbr (this repo) + apimain (rustdesk-api fork)
+# and publish the all-in-one Docker image to GHCR.
+#
+# Deployments (HK + IOC) pull: ghcr.io/xiaochen301/rustdesk-server-xc
+# Binaries are also uploaded as workflow artifacts (for manual fallback).
+# Triggered manually or by pushes to xc/** branches.
 name: xc-build
 
 on:
@@ -12,16 +14,17 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build-linux-amd64:
-    name: Build hbbs/hbbr (linux amd64, alpine/musl)
+    name: Build hbbs/hbbr + apimain + docker image (linux amd64)
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout
+      - name: Checkout (server)
         uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -35,27 +38,62 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Build (alpine, musl native)
+      - name: Build hbbs/hbbr (alpine, musl native)
         run: |
           mkdir -p "$HOME/.cargo/registry"
           docker run --rm -v "$PWD:/src" -w /src \
             -v "$HOME/.cargo/registry:/usr/local/cargo/registry" \
             rust:1.95-alpine sh -c "apk add --no-cache musl-dev openssl-dev openssl-libs-static perl make cmake gcc g++ pkgconf && cargo build --release --locked --bin hbbs --bin hbbr --bin rustdesk-utils"
 
-      - name: Collect artifacts
+      - name: Collect binary artifacts
         run: |
-          mkdir -p dist
+          mkdir -p dist xc-artifacts
           cp target/release/hbbs dist/
           cp target/release/hbbr dist/
           cp target/release/rustdesk-utils dist/
-          file dist/hbbs
           sha256sum dist/* | tee dist/SHA256SUMS
           ls -la dist/
 
-      - name: Upload artifacts
+      - name: Upload binary artifacts
         uses: actions/upload-artifact@v4
         with:
           name: hbbs-hbbr-musl-amd64
           path: dist/
           if-no-files-found: error
           retention-days: 30
+
+      # ---- XC custom image: hbbs + hbbr + apimain into the s6 all-in-one base ----
+      - name: Checkout (api fork)
+        uses: actions/checkout@v4
+        with:
+          repository: xiaochen301/rustdesk-api
+          ref: xc/auto-sync
+          path: api-src
+
+      - name: Build apimain (alpine, CGO static)
+        run: |
+          docker run --rm -v "$PWD/api-src:/src" -w /src golang:alpine sh /src/build-alpine.sh
+          APIMAIN="$(find api-src -name apimain -type f | head -1)"
+          test -n "$APIMAIN"
+          cp "$APIMAIN" dist/apimain
+          cp "$APIMAIN" xc-artifacts/apimain
+          cp target/release/hbbs xc-artifacts/hbbs
+          cp target/release/hbbr xc-artifacts/hbbr
+          ls -la xc-artifacts/ dist/
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.xc
+          push: true
+          tags: |
+            ghcr.io/xiaochen301/rustdesk-server-xc:latest
+            ghcr.io/xiaochen301/rustdesk-server-xc:${{ github.sha }}
