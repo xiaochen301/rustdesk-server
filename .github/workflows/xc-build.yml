@@ -1,0 +1,54 @@
+# XC: build our customized hbbs/hbbr for the XC server deployments (HK + IOC).
+# Produces static musl binaries for linux amd64 to match the s6 container base.
+# Triggered manually or by pushes to xc/** branches.
+name: xc-build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'xc/**'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux-amd64:
+    name: Build hbbs/hbbr (linux amd64, musl)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build (cross, musl)
+        run: cross build --release --locked --target x86_64-unknown-linux-musl --bin hbbs --bin hbbr --bin rustdesk-utils
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/hbbs dist/
+          cp target/x86_64-unknown-linux-musl/release/hbbr dist/
+          cp target/x86_64-unknown-linux-musl/release/rustdesk-utils dist/
+          sha256sum dist/* | tee dist/SHA256SUMS
+          ls -la dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hbbs-hbbr-musl-amd64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
