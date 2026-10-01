@@ -27,22 +27,46 @@
 4. **按 id 精准投递**：打洞请求转发优先经 ws_id_map 直达目标设备
    （NAT 同 IP 多设备场景正确路由；同时消除对 ws 目标发 UDP 必然失败的问题）。
 5. **限流放行**：ws 注册不受 IP 限流硬拒（记录日志并放行，ws 客户端无其它通道可重试）。
-6. **健壮性**：UDP 单条消息错误不再重启 UDP 子系统；端口 0 / 无效地址发送直接丢弃。
-7. **默认行为边界**：以上 ws 增强仅作用于 ws 通道；纯 TCP 路径保持官方原语义。
+6. **ws 保活刷新**：ws 通道的每次 RegisterPk（含心跳回显）都刷新 `last_reg_time`
+   （纯 ws 部署的唯一保活路径；缺此条件时设备 30s 后集体被判「离线」）。
+7. **健壮性**：UDP 单条消息错误不再重启 UDP 子系统；端口 0 / 无效地址发送直接丢弃。
+8. **默认行为边界**：以上 ws 增强仅作用于 ws 通道；纯 TCP 路径保持官方原语义。
 
-## 构建
+## 构建与镜像发布（GitHub Actions）
 
-- GitHub Actions：`.github/workflows/xc-build.yml`（手动触发，或 push `xc/**` 分支自动触发）
-- 产物：`hbbs` / `hbbr` / `rustdesk-utils`（linux amd64, musl 静态），附 SHA256SUMS
-- 本地交叉编译：`cross build --release --target x86_64-unknown-linux-musl`
+`.github/workflows/xc-build.yml`（手动触发，或 push `xc/**` 分支自动触发）产出：
 
-## 部署
+1. **all-in-one Docker 镜像**（推荐部署方式）→ 自动推送到 GHCR：
 
-- 替换 s6 容器内 `/usr/bin/hbbs`（香港当前为 bind-mount `/root/hbbs-xc`）
-- 部署前备份现行二进制；回滚 = 换回旧二进制并重启容器
+   ```
+   ghcr.io/xiaochen301/rustdesk-server-xc:latest
+   ghcr.io/xiaochen301/rustdesk-server-xc:<git-sha>
+   ```
+
+   镜像 = `lejianwen/rustdesk-server-s6`（s6 all-in-one 基础，香港/内网同款）
+   之上覆盖三个定制二进制：
+   - `/usr/bin/hbbs`   — 本仓库（xc/ws-enhance）
+   - `/usr/bin/hbbr`   — 本仓库
+   - `/app/apimain`    — rustdesk-api fork（xiaochen301/rustdesk-api, xc/auto-sync，
+                          v2.7 + AutoSyncService 自动入簿）
+
+2. **裸二进制**（fallback / 手动应急）→ workflow artifacts：
+   `hbbs` / `hbbr` / `rustdesk-utils`（linux amd64, musl 静态）+ SHA256SUMS。
+
+## 部署（香港 / 内网统一）
+
+```
+1. compose 中 image 改为:  ghcr.io/xiaochen301/rustdesk-server-xc:latest
+2. docker compose pull && docker compose up -d
+3. 验证: 观察者在线查询 + docker logs（update_pk 心跳刷新）
+```
+
+- 数据卷（./data）与 env 全部保留，重建无损。
+- 回滚：compose 换回原 image（或上一个 sha tag）→ `docker compose up -d`。
+- 二进制替换（旧方式，应急）：替换容器内 `/usr/bin/hbbs`、`/app/apimain` 后重启容器。
 
 ## 与上游同步
 
 - `upstream` = https://github.com/rustdesk/rustdesk-server
 - 升级流程：merge/rebase `upstream/master` → 处理 `src/rendezvous_server.rs`
-  冲突（改动集中在发送路径与监听循环）→ 构建 → 测试 → 部署
+  冲突（改动集中在发送路径与监听循环）→ 构建 → 香港测试 → 镜像发布 → 部署

@@ -81,6 +81,30 @@ jobs:
           cp target/release/hbbr xc-artifacts/hbbr
           ls -la xc-artifacts/ dist/
 
+      # ---- XC: admin frontend (rustdesk-api-web fork) ----
+      - name: Checkout (web fork)
+        uses: actions/checkout@v4
+        with:
+          repository: xiaochen301/rustdesk-api-web
+          ref: xc/refactor-admin
+          path: web-src
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web-src/package-lock.json
+
+      - name: Build admin frontend
+        run: |
+          cd web-src
+          (npm ci --no-audit --no-fund || npm install --no-audit --no-fund)
+          npm run build
+          mkdir -p "$PWD/../xc-artifacts/admin"
+          cp -r dist/* "$PWD/../xc-artifacts/admin/"
+          ls -la "$PWD/../xc-artifacts/admin/" | head -10
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
