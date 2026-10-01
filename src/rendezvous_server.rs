@@ -755,7 +755,13 @@ impl RendezvousServer {
                 );
             }
         }
-        if changed {
+        if changed || ws {
+            // XC: pure-ws devices (no UDP channel, e.g. only 443 reachable) live
+            // entirely on the websocket. Their periodic RegisterPk heartbeat echo
+            // usually reports unchanged values, so without this branch
+            // last_reg_time would never refresh and every device would expire
+            // from the online list after REG_TIMEOUT (30s) - "all devices
+            // offline". Same fix as the previous production line (v7final).
             self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
         }
         RegisterPkOutcome::Respond(register_pk_response::Result::OK)
