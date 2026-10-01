@@ -1,6 +1,7 @@
 # XC: build our customized hbbs/hbbr for the XC server deployments (HK + IOC).
-# Produces static musl binaries for linux amd64 to match the s6 container base.
-# Triggered manually or by pushes to xc/** branches.
+# Builds inside an Alpine container (musl native, same family as the s6 base
+# image) so the output is a static musl binary - the known-good path for both
+# deployments. Triggered manually or by pushes to xc/** branches.
 name: xc-build
 
 on:
@@ -17,7 +18,7 @@ env:
 
 jobs:
   build-linux-amd64:
-    name: Build hbbs/hbbr (linux amd64, musl)
+    name: Build hbbs/hbbr (linux amd64, alpine/musl)
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
@@ -25,23 +26,29 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
         with:
-          targets: x86_64-unknown-linux-musl
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Install cross
-        uses: taiki-e/install-action@cross
-
-      - name: Build (cross, musl)
-        run: cross build --release --locked --target x86_64-unknown-linux-musl --bin hbbs --bin hbbr --bin rustdesk-utils
+      - name: Build (alpine, musl native)
+        run: |
+          mkdir -p "$HOME/.cargo/registry"
+          docker run --rm -v "$PWD:/src" -w /src \
+            -v "$HOME/.cargo/registry:/usr/local/cargo/registry" \
+            rust:1.95-alpine sh -c "apk add --no-cache musl-dev openssl-dev openssl-libs-static perl make cmake gcc g++ pkgconf && cargo build --release --locked --bin hbbs --bin hbbr --bin rustdesk-utils"
 
       - name: Collect artifacts
         run: |
           mkdir -p dist
-          cp target/x86_64-unknown-linux-musl/release/hbbs dist/
-          cp target/x86_64-unknown-linux-musl/release/hbbr dist/
-          cp target/x86_64-unknown-linux-musl/release/rustdesk-utils dist/
+          cp target/release/hbbs dist/
+          cp target/release/hbbr dist/
+          cp target/release/rustdesk-utils dist/
+          file dist/hbbs
           sha256sum dist/* | tee dist/SHA256SUMS
           ls -la dist/
 
