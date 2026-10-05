@@ -568,6 +568,13 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     allow_err!(self.handle_hole_sent(phs, addr, None).await);
                 }
+                Some(rendezvous_message::Union::IceCandidate(ice)) => {
+                    // XC-PATCH-RD-008: WebRTC trickle candidate. Keep the
+                    // connection open - candidate-carrying connections serve a
+                    // whole trickle and are reused per candidate.
+                    allow_err!(self.handle_ice_candidate(ice).await);
+                    return true;
+                }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
                     allow_err!(self.handle_local_addr(la, addr, None).await);
                 }
@@ -787,6 +794,9 @@ impl RendezvousServer {
             socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
+            // XC-PATCH-RD-008: carry the controlled side's WebRTC answer back to
+            // the controller (empty for plain, non-WebRTC punches).
+            webrtc_sdp_answer: phs.webrtc_sdp_answer,
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
@@ -797,6 +807,40 @@ impl RendezvousServer {
             socket.send(&msg_out, addr_a).await?;
         } else {
             self.send_to_tcp(msg_out, addr_a).await;
+        }
+        Ok(())
+    }
+
+    // XC-PATCH-RD-008: relay WebRTC trickle candidates between the two peers
+    // of a punch session (mirrors the client-expected routing; the official
+    // paired server change is not released yet, old servers drop the fields
+    // and clients silently fall back).
+    //  - controlled side -> controller: `socket_addr` carries the echo of the
+    //    controller's mangled address (`PunchHole.socket_addr`), so it is
+    //    resolved through tcp_punch and lands on the controller's punch
+    //    socket, which stays open for the whole trickle.
+    //  - controller -> controlled side: `id` names the target device; the
+    //    candidate is delivered over its websocket route, and the controlled
+    //    side matches the session by `session_key` itself.
+    #[inline]
+    async fn handle_ice_candidate(&mut self, ice: IceCandidate) -> ResultType<()> {
+        if !ice.socket_addr.is_empty() {
+            let addr_a = AddrMangle::decode(&ice.socket_addr);
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_ice_candidate(ice);
+            self.send_to_tcp_sync(msg_out, addr_a).await?;
+        } else if !ice.id.is_empty() {
+            let id = ice.id.clone();
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_ice_candidate(ice);
+            if !self.send_to_ws_peer(&id, &msg_out).await {
+                log::debug!(
+                    "XC-PATCH-RD-008: drop ice candidate, no ws route for id={}",
+                    id
+                );
+            }
+        } else {
+            log::debug!("XC-PATCH-RD-008: ice candidate without route info, dropped");
         }
         Ok(())
     }
@@ -926,10 +970,14 @@ impl RendezvousServer {
                     peer_addr,
                     addr
                 );
+                // XC-PATCH-RD-008: forward the controller's WebRTC offer to the
+                // controlled side (the paired upstream server change is not
+                // released yet; old servers drop the field and clients fall back).
                 msg_out.set_punch_hole(PunchHole {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    webrtc_sdp_offer: ph.webrtc_sdp_offer,
                     ..Default::default()
                 });
             }
@@ -978,12 +1026,16 @@ impl RendezvousServer {
         Ok(())
     }
 
+    // XC-PATCH-RD-008: deliver to a punch connection and KEEP it registered -
+    // the controller's punch socket carries the whole WebRTC trickle (the
+    // response plus every IceCandidate), so the sink must survive past the
+    // first write. The entry is removed when the connection closes.
     #[inline]
     async fn send_to_tcp(&mut self, msg: RendezvousMessage, addr: SocketAddr) {
-        let mut tcp = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-        tokio::spawn(async move {
-            Self::send_to_sink(&mut tcp, msg).await;
-        });
+        let mut map = self.tcp_punch.lock().await;
+        if let Some(sink) = map.get_mut(&try_into_v4(addr)) {
+            Self::send_sink(sink, &msg).await;
+        }
     }
 
     #[inline]
@@ -1074,14 +1126,19 @@ impl RendezvousServer {
         self.ws_id_map.lock().await.retain(|_, v| *v != key);
     }
 
+    // XC-PATCH-RD-008: like before, but keep the route registered - a
+    // RelayResponse may carry the WebRTC answer and ICE candidates follow on
+    // the same connection (see send_to_tcp).
     #[inline]
     async fn send_to_tcp_sync(
         &mut self,
         msg: RendezvousMessage,
         addr: SocketAddr,
     ) -> ResultType<()> {
-        let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-        Self::send_to_sink(&mut sink, msg).await;
+        let mut map = self.tcp_punch.lock().await;
+        if let Some(sink) = map.get_mut(&try_into_v4(addr)) {
+            Self::send_sink(sink, &msg).await;
+        }
         Ok(())
     }
 
@@ -1515,7 +1572,7 @@ impl RendezvousServer {
                 Some(peer) => {
                     let pk = peer.read().await.pk.clone();
                     sign::sign(
-                        &hbb_common::message_proto::IdPk {
+                        &hbb_common::rendezvous_proto::IdPk {
                             id,
                             pk,
                             ..Default::default()
